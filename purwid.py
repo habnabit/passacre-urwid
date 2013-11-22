@@ -1,6 +1,9 @@
 import collections
+import json
+import os
 
 from passacre.application import Passacre, is_likely_hashed_site
+from twisted.internet import defer
 import urwid
 
 import pencrypt
@@ -9,7 +12,20 @@ import pencrypt
 class Application(object):
     def __init__(self):
         self._popup_stack = []
-        self.widget = urwid.WidgetPlaceholder(urwid.SolidFill())
+
+    def start(self):
+        self.passacre = Passacre()
+        all_sites = {k: v
+                     for k, v in self.passacre.config.get_all_sites().iteritems()
+                     if not is_likely_hashed_site(k)}
+        all_schemata = self.passacre.config.get_all_schemata()
+
+        headings = [
+            ('Sites', SiteList(all_sites)),
+            ('Schemata', FilteringChoiceBox({k: PassacreSchemaRow(k, v) for k, v in all_schemata.iteritems()})),
+        ]
+        self.widget = urwid.WidgetPlaceholder(Headings(headings))
+        return self.widget
 
     def popup(self, widget, **kw):
         kw.setdefault('align', 'center')
@@ -20,6 +36,11 @@ class Application(object):
 
     def close_popup(self):
         self.widget.original_widget = self._popup_stack.pop()
+
+    def prompt_password(self, prompt):
+        dialog = PasswordPromptDialog(prompt)
+        self.popup(dialog, width='pack', height='pack')
+        return dialog.deferred
 
 
 app = Application()
@@ -89,15 +110,18 @@ class PasswordPromptDialog(urwid.WidgetWrap):
     app = app
 
     def __init__(self, prompt):
+        self._edit = urwid.Edit(mask='*')
         self._w = dialog(urwid.ListBox(urwid.SimpleListWalker([
             urwid.Text(prompt),
             urwid.Divider(),
-            urwid.Edit(mask='*'),
+            self._edit,
         ])), size=(40, 7))
+        self.deferred = defer.Deferred()
 
     def keypress(self, size, key):
         if key == 'enter':
             self.app.close_popup()
+            self.deferred.callback(self._edit.edit_text)
         return self._w.keypress(size, key)
 
 
@@ -246,6 +270,10 @@ class FilteringChoiceBox(urwid.WidgetWrap):
         to_keep = [w for _, w in sorted(self._filtered_choices())]
         merge_sorted_lists(to_keep, self._widget_list)
 
+    def add_widgets(self, widgets):
+        self._all_widgets.update(widgets)
+        self._filter_choices()
+
     def keypress(self, size, key):
         if not self.filtering:
             if key == '/':
@@ -265,18 +293,52 @@ class FilteringChoiceBox(urwid.WidgetWrap):
         self._filter_choices()
 
 
-passacre = Passacre()
-all_sites = {k: v for k, v in passacre.config.get_all_sites().iteritems() if not is_likely_hashed_site(k)}
-all_schemata = passacre.config.get_all_schemata()
+class SiteList(urwid.WidgetWrap):
+    app = app
 
-headings = [
-    ('Sites', FilteringChoiceBox({k: PassacreSiteRow(k, v) for k, v in all_sites.iteritems()})),
-    ('Schemata', FilteringChoiceBox({k: PassacreSchemaRow(k, v) for k, v in all_schemata.iteritems()})),
-]
+    def __init__(self, all_sites):
+        self.all_sites = all_sites
+        self._filter = FilteringChoiceBox({k: PassacreSiteRow(k, v) for k, v in all_sites.iteritems()})
+        self._w = urwid.Pile([
+            self._filter,
+            ('pack', urwid.Text(' <F1> Load encrypted sites  <F2> Save encrypted sites')),
+        ])
 
-app.widget.original_widget = Headings(headings)
+    def keypress(self, size, key):
+        if key == 'f1':
+            d = self.app.prompt_password('Password for decryption:')
+            d.addCallback(self._file_of_password)
+            d.addCallback(self._decrypt_sites)
+        elif key == 'f2':
+            d = self.app.prompt_password('Password for encryption:')
+            d.addCallback(self._file_of_password)
+            d.addCallback(self._encrypt_sites)
+        else:
+            return self.__super.keypress(size, key)
+
+    def _file_of_password(self, password):
+        box = pencrypt.box_of_config_and_password(self.app.passacre.config, password)
+        fobj = pencrypt.EncryptedFile(box, os.path.expanduser('~/.config/passacre/sites'))
+        return fobj
+
+    def _decrypt_sites(self, fobj):
+        data = json.loads(fobj.read().decode())
+        d = self.app.prompt_password('Password for hashed sites:')
+        d.addCallback(self._add_hashed_sites, data)
+
+    def _add_hashed_sites(self, password, sites):
+        site_data = {site: self.app.passacre.config.get_site(site, password)
+                     for site in sites}
+        self.all_sites.update(site_data)
+        self._filter.add_widgets({k: PassacreSiteRow(k, v)
+                                  for k, v in site_data.iteritems()})
+
+    def _encrypt_sites(self, fobj):
+        data = json.dumps(list(self.all_sites)).encode()
+        fobj.write(data)
+
 
 if __name__ == '__main__':
     urwid.MainLoop(
-        app.widget,
+        app.start(),
         palette=[('reversed', 'black', 'light gray')]).run()
