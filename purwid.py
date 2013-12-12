@@ -1,12 +1,10 @@
 import collections
-import json
-import os
 
+from passacre.agent import commands
 from passacre.application import Passacre, is_likely_hashed_site
-from twisted.internet import defer
+from twisted.internet import endpoints, task, defer
+from twisted.protocols.amp import AMP
 import urwid
-
-import pencrypt
 
 
 class Application(object):
@@ -25,7 +23,11 @@ class Application(object):
             ('Schemata', FilteringChoiceBox({k: PassacreSchemaRow(k, v) for k, v in all_schemata.iteritems()})),
         ]
         self.widget = urwid.WidgetPlaceholder(Headings(headings))
-        return self.widget
+        self.mainloop = urwid.MainLoop(
+            self.widget,
+            palette=[('reversed', 'black', 'light gray')],
+            event_loop=urwid.TwistedEventLoop())
+        return self.mainloop
 
     def popup(self, widget, **kw):
         kw.setdefault('align', 'center')
@@ -33,17 +35,46 @@ class Application(object):
         self._popup_stack.append(self.widget.original_widget)
         self.widget.original_widget = urwid.Overlay(
             widget, self.widget.original_widget, **kw)
+        self.mainloop.draw_screen()
 
     def close_popup(self):
         self.widget.original_widget = self._popup_stack.pop()
+        self.mainloop.draw_screen()
 
     def prompt_password(self, prompt):
         dialog = PasswordPromptDialog(prompt)
         self.popup(dialog, width='pack', height='pack')
         return dialog.deferred
 
+    def wrap_deferred(self, deferred, caption, with_errback=True):
+        dialog = DeferredDisplayDialog(deferred, caption)
+        self.popup(dialog, width='pack', height='pack')
+        if with_errback:
+            deferred.addErrback(self.show_errback)
+        return deferred
+
+    def show_errback(self, failure, propagate=True):
+        text = failure.getTraceback()
+        self.display_text(text)
+        if propagate:
+            return failure
+
+    def display_text(self, caption):
+        dialog = TextDisplayDialog(caption)
+        self.popup(dialog, width='pack', height='pack')
+
 
 app = Application()
+
+
+def run_amp_command(description, command, args, reactor=None):
+    if reactor is None:
+        from twisted.internet import reactor
+    endpoint = endpoints.clientFromString(reactor, description)
+    amp = AMP()
+    d = endpoints.connectProtocol(endpoint, amp)
+    d.addCallback(lambda ign: amp.callRemote(command, **args))
+    return d
 
 
 class SelectableText(urwid.WidgetWrap):
@@ -122,7 +153,43 @@ class PasswordPromptDialog(urwid.WidgetWrap):
         if key == 'enter':
             self.app.close_popup()
             self.deferred.callback(self._edit.edit_text)
+        elif key == 'esc':
+            self.app.close_popup()
+            self.deferred.errback(defer.CancelledError())
         return self._w.keypress(size, key)
+
+
+class DeferredDisplayDialog(urwid.WidgetWrap):
+    app = app
+
+    def __init__(self, deferred, caption):
+        self._cancel = urwid.Button('Cancel')
+        self._w = dialog(urwid.ListBox(urwid.SimpleListWalker([
+            urwid.Text(caption),
+            urwid.Divider(),
+            self._cancel,
+        ])), size=(40, 7))
+        deferred.addBoth(self._close)
+        urwid.connect_signal(self._cancel, 'click', lambda x: deferred.cancel())
+
+    def _close(self, result):
+        self.app.close_popup()
+        return result
+
+
+class TextDisplayDialog(urwid.WidgetWrap):
+    app = app
+
+    def __init__(self, caption):
+        self._ok = urwid.Button('OK')
+        caption = urwid.Text(caption)
+        w, h = caption.pack((116,))
+        self._w = dialog(urwid.ListBox(urwid.SimpleListWalker([
+            caption,
+            urwid.Divider(),
+            self._ok,
+        ])), size=(w + 6, h + 6))
+        urwid.connect_signal(self._ok, 'click', lambda x: self.app.close_popup())
 
 
 class ConfigRow(urwid.WidgetWrap):
@@ -301,44 +368,32 @@ class SiteList(urwid.WidgetWrap):
         self._filter = FilteringChoiceBox({k: PassacreSiteRow(k, v) for k, v in all_sites.iteritems()})
         self._w = urwid.Pile([
             self._filter,
-            ('pack', urwid.Text(' <F1> Load encrypted sites  <F2> Save encrypted sites')),
+            ('pack', urwid.Text(' <F1> Load site list')),
         ])
 
     def keypress(self, size, key):
         if key == 'f1':
-            d = self.app.prompt_password('Password for decryption:')
-            d.addCallback(self._file_of_password)
-            d.addCallback(self._decrypt_sites)
-        elif key == 'f2':
-            d = self.app.prompt_password('Password for encryption:')
-            d.addCallback(self._file_of_password)
-            d.addCallback(self._encrypt_sites)
+            d = run_amp_command('tcp:localhost:9000', commands.FetchSiteList, {})
+            self.app.wrap_deferred(d, 'Fetching site list...', with_errback=False)
+            d.addCallback(self._add_sites)
+            d.addErrback(self.app.show_errback, propagate=False)
         else:
             return self.__super.keypress(size, key)
 
-    def _file_of_password(self, password):
-        box = pencrypt.box_of_config_and_password(self.app.passacre.config, password)
-        fobj = pencrypt.EncryptedFile(box, os.path.expanduser('~/.config/passacre/sites'))
-        return fobj
-
-    def _decrypt_sites(self, fobj):
-        data = json.loads(fobj.read().decode())
+    def _add_sites(self, results):
+        sites = results['sites']
         d = self.app.prompt_password('Password for hashed sites:')
-        d.addCallback(self._add_hashed_sites, data)
+        d.addCallback(self._add_hashed_sites, sites)
+        return d
 
     def _add_hashed_sites(self, password, sites):
         site_data = {site: self.app.passacre.config.get_site(site, password)
-                     for site in sites}
+                     for site in sites
+                     if site not in self.all_sites}
         self.all_sites.update(site_data)
         self._filter.add_widgets({k: PassacreSiteRow(k, v)
                                   for k, v in site_data.iteritems()})
 
-    def _encrypt_sites(self, fobj):
-        data = json.dumps(list(self.all_sites)).encode()
-        fobj.write(data)
-
 
 if __name__ == '__main__':
-    urwid.MainLoop(
-        app.start(),
-        palette=[('reversed', 'black', 'light gray')]).run()
+    app.start().run()
